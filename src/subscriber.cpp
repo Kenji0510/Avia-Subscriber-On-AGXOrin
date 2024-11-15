@@ -13,49 +13,36 @@
 #include <tf/transform_datatypes.h>
 #include <vector>
 #include <eigen3/Eigen/Dense>
+#include <boost/asio.hpp>
+#include <boost/thread.hpp>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 #include "downsample.hpp"
 #include "send_data.h"
 #include "transform_data.hpp"
+#include "subscriber.hpp"
 
 
 data_packet *data_packet_ptr = NULL;
+Thread_Control_Flag *thread_control_flag = NULL;
+std::condition_variable push_cv;
+bool can_push_data_laser_map = false;
+std::condition_variable send_cv;
+bool can_send_pcd = false;
 const int MAX_DATA_SIZE = 100;
-Eigen::Vector3d integrated_angle(0.0, 0.0, 0.0);
-const double time_interval = 1.0 / 200.0;
 size_t count = 0;
 
-std::vector<Eigen::Vector3d> angular_velocity_array;
-Eigen::Vector3d max_angular_velocity(0.0, 0.0, 0.0);
 
 int imu_callback_count = 0;
 ros::Time last_time;
-Eigen::Vector3d accumulated_angle(0.0, 0.0, 0.0);
-double roll = 0.0;
-double pitch = 0.0;
-double yaw = 0.0;
+
+size_t num_points_laser_map = 0;
 
 
-void save_angular_velocity_data() {
-    std::ofstream file;
-    file.open("/home/kenji/ws_livox/src/lidar_subscriber/src/angle_velocity_data.txt");
-    for (int i = 0; i < angular_velocity_array.size(); i++) {
-        file << angular_velocity_array[i](0) << ", " << angular_velocity_array[i](1) << ", " << angular_velocity_array[i](2) << std::endl;
-    }
-    file.close();
-}
-
-void check_max_value(Eigen::Vector3d angular_velocity) {
-    if (angular_velocity(0) > max_angular_velocity(0)) {
-        max_angular_velocity(0) = angular_velocity(0);
-    }
-    if (angular_velocity(1) > max_angular_velocity(1)) {
-        max_angular_velocity(1) = angular_velocity(1);
-    }
-    if (angular_velocity(2) > max_angular_velocity(2)) {
-        max_angular_velocity(2) = angular_velocity(2);
-    }
-}
+std::atomic<bool> stop_send_flag(true); // To wait send process untill 15s from initial running 
+ros::Time last_callback_time;   // To gets point cloud data from /Laser_map topic(FAST-LIO) at 3Hz
 
 std::string createTimestampedFilename(std::string path) {
     //std::string path = "/home/kenji/pcd";
@@ -69,54 +56,114 @@ std::string createTimestampedFilename(std::string path) {
 
     // Create FileName
     //std::string fileName = path + "/saved_cloud_pub_freq_" + std::to_string(2) + "_" + ss.str() + ".pcd";
-    std::string file_name = path + "/pub_freq_" + std::to_string(2) + "_" + "voxel_size_01_nb_neighbors_30_std_ratio_01_" + ss.str() + ".pcd";
+    //std::string file_name = path + "/pub_freq_" + std::to_string(2) + "_" + "voxel_size_01_nb_neighbors_30_std_ratio_01_" + ss.str() + ".pcd";
+    std::string file_name = path + "/pub_freq_" + std::to_string(2) + "_" + ss.str() + ".pcd";
     return file_name;
 }
 
-void callback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
+void callback_for_laser_map(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
+    if (stop_send_flag == true) {
+        return;
+    }
+
+    ros::Time current_time = ros::Time::now();
+    if((current_time - last_callback_time).toSec() < (1.0 / 2.0)) { // Default is 3Hz
+        return;
+    } else {
+        last_callback_time = current_time;
+    }
+
     auto source = std::make_shared<open3d::geometry::PointCloud>();
     auto source_downsampled = std::make_shared<open3d::geometry::PointCloud>();
-    Eigen::Vector3d delta_angle = Eigen::Vector3d::Zero();
+    //Eigen::Vector3d delta_angle = Eigen::Vector3d::Zero();
 
-    if (data_packet_ptr == NULL) {
-        data_packet_ptr = (data_packet*)malloc(sizeof(data_packet));
-        data_packet_ptr->float_array_ptr = (double*)malloc(sizeof(double) * NUM_FLOATS * 3);
+    // if (data_packet_ptr == NULL) {
+    //     data_packet_ptr = (data_packet*)malloc(sizeof(data_packet));
+    //     data_packet_ptr->float_array_ptr = (double*)malloc(sizeof(double) * NUM_FLOATS * 3);
+    // }
+
+    // Convert ROS PointCloud2 to PCL PointCloud
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::fromROSMsg(*cloud_msg, *pcl_cloud);
+
+    // Transform the point cloud data from PCL PointCloud to Open3D PointCloud
+    for (const auto& point : pcl_cloud->points) {
+        source->points_.push_back(Eigen::Vector3d(point.x, point.y, point.z));
+    }
+    printf("\e[36m<--- /Laser_map process --->\e[0m\n");
+    printf("\e[33m<--- Start of session --->\e[0m\n");
+
+    {   
+        std::lock_guard<std::mutex> lock(thread_control_flag->access_gpu_mutex);
+        // Downsample the point cloud and remove noise
+        downsample(source, source_downsampled);
+    }
+    //data_packet_ptr->after_voxel_time = time(NULL);
+
+    //data_packet_ptr->unix_time = time(NULL);
+    data_packet_ptr->num_points_of_laser_map = source_downsampled->points_.size();
+    // data_packet_ptr->angle_velocity_x = delta_angle(0);
+    // data_packet_ptr->angle_velocity_y = delta_angle(1);
+    // data_packet_ptr->angle_velocity_z = delta_angle(2);
+    // data_packet_ptr->roll = roll;
+    // data_packet_ptr->pitch = pitch;
+    // data_packet_ptr->yaw = yaw;
+    {
+        // Transform the point cloud data from Open3D PointCloud to data_packet
+        std::lock_guard<std::mutex> lock(thread_control_flag->float_array_ptr_mutex);
+        transform_data(source_downsampled, data_packet_ptr, 0);
+        num_points_laser_map = data_packet_ptr->num_points_of_laser_map;
+        can_push_data_laser_map = true;
+    }
+    push_cv.notify_one();
+
+    // Send the point cloud data to the server
+    //int run_result = send_data("180.145.242.113", "1234", data_packet_ptr);
+
+    // Timesstamped filename
+    //std::string file_path = "/home/kenji/pcd";
+    std::string file_path = "/home/kenji/ws_livox/src/lidar_subscriber/data/fast-lio";
+    std::string file_name = createTimestampedFilename(file_path);
+
+    count += 1;
+
+    printf("\e[36m<--- End of session --->\e[0m\n");
+    printf("\e[36m<--- /Laser_map process --->\e[0m\n");
+
+    // Save to a PCD file
+    //pcl::io::savePCDFileASCII(fileName, *pcl_cloud);
+
+    // Save to a PCD file
+    // bool result = open3d::io::WritePointCloud(file_name, *source_downsampled);
+    // if (result) {
+    //     std::cout << "\e[32m" << "Successfully saved the point cloud." << "\e[m" << std::endl;
+    // } else {
+    //     std::cerr << "\e[31m" << "Failed to save the point cloud." << "\e[m" << std::endl;
+    // }
+
+    //ROS_INFO("Saved %d data points to %s", cloud->size(), fileName.c_str());
+}
+
+void callback_for_cloud_registered(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
+    if (stop_send_flag == true) {
+        return;
     }
 
-    if (imu_callback_count > 0) {
-        // 前回のCallback()からの時間経過
-        ros::Time current_time = ros::Time::now();
-        double time_interval = (current_time - last_time).toSec();
-
-        // 平均化された角速度を計算
-        Eigen::Vector3d average_angular_velocity = accumulated_angle / imu_callback_count;
-
-        // 角速度の積分で角度の変化を計算（角度 = 角速度 * 時間）
-        delta_angle = average_angular_velocity * time_interval;
-
-        // 角度変化を度に変換
-        delta_angle(0) = delta_angle(0) * 180 / M_PI;
-        delta_angle(1) = delta_angle(1) * 180 / M_PI;
-        delta_angle(2) = delta_angle(2) * 180 / M_PI;
-
-        std::cout << "Delta Angle (Degrees): " << delta_angle << std::endl;
-
-        yaw = delta_angle(2);
-
-        // Print the results
-        ROS_INFO("IMU Data - Roll: [%f] degrees, Pitch: [%f] degrees, Yaw: [%f] dgrees", roll, pitch, yaw);
-
-        // 変数のリセット
-        accumulated_angle.setZero();
-        imu_callback_count = 0;
-        last_time = current_time; // 時間の更新
-
+    ros::Time current_time = ros::Time::now();
+    if((current_time - last_callback_time).toSec() < (1.0 / 2.0)) { // Default is 3Hz
+        return;
     } else {
-        ROS_WARN("No IMU data received since last Callback.");
+        last_callback_time = current_time;
     }
 
-    // To measure the process times.
-    data_packet_ptr->initial_time = time(NULL);
+    auto source = std::make_shared<open3d::geometry::PointCloud>();
+    auto source_downsampled = std::make_shared<open3d::geometry::PointCloud>();
+    //Eigen::Vector3d delta_angle = Eigen::Vector3d::Zero();
+
+    // if (data_packet_ptr == NULL) {
+    //     data_packet_ptr = (data_packet*)malloc(sizeof(data_packet));
+    //     data_packet_ptr->float_array_ptr = (double*)malloc(sizeof(double) * NUM_FLOATS * 3);
+    // }
 
     // Convert ROS PointCloud2 to PCL PointCloud
     pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
@@ -127,149 +174,101 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
         source->points_.push_back(Eigen::Vector3d(point.x, point.y, point.z));
     }
 
+    printf("\e[36m<--- /cloud_registered process --->\e[0m\n");
     printf("\e[33m<--- Start of session --->\e[0m\n");
 
-    // Downsample the point cloud and remove noise
-    downsample(source, source_downsampled);
-    data_packet_ptr->after_voxel_time = time(NULL);
+    {   
+        std::lock_guard<std::mutex> lock(thread_control_flag->access_gpu_mutex);
+        // Downsample the point cloud and remove noise
+        downsample(source, source_downsampled);
+    }
+    //data_packet_ptr->after_voxel_time = time(NULL);
 
     //data_packet_ptr->unix_time = time(NULL);
-    data_packet_ptr->num_points = source_downsampled->points_.size();
-    data_packet_ptr->angle_velocity_x = delta_angle(0);
-    data_packet_ptr->angle_velocity_y = delta_angle(1);
-    data_packet_ptr->angle_velocity_z = delta_angle(2);
-    data_packet_ptr->roll = roll;
-    data_packet_ptr->pitch = pitch;
-    data_packet_ptr->yaw = yaw;
+    data_packet_ptr->num_points_of_cloud_registered = source_downsampled->points_.size();
+    // data_packet_ptr->angle_velocity_x = delta_angle(0);
+    // data_packet_ptr->angle_velocity_y = delta_angle(1);
+    // data_packet_ptr->angle_velocity_z = delta_angle(2);
+    // data_packet_ptr->roll = roll;
+    // data_packet_ptr->pitch = pitch;
+    // data_packet_ptr->yaw = yaw;
 
-    // Transform the point cloud data from Open3D PointCloud to data_packet
-    transform_data(source_downsampled, data_packet_ptr);
+    {
+        // Transform the point cloud data from Open3D PointCloud to data_packet
+        std::unique_lock<std::mutex> lock(thread_control_flag->float_array_ptr_mutex);
+        push_cv.wait(lock, [] { return can_push_data_laser_map; });
+        transform_data(source_downsampled, data_packet_ptr, num_points_laser_map);
+        can_push_data_laser_map = false;
+        can_send_pcd = true;
+    }
 
     // Send the point cloud data to the server
-    int result = send_data("180.145.242.113", "1234", data_packet_ptr);
-
-    // Free allocated memory
-    //free(data_packet_ptr->float_array_ptr);
-    //free(data_packet_ptr);
+    //int run_result = send_data("180.145.242.113", "1234", data_packet_ptr);
 
     // Timesstamped filename
     //std::string file_path = "/home/kenji/pcd";
-    // std::string file_path = "/home/kenji/pcd/downsampled_pcd";
-    // std::string file_name = createTimestampedFilename(file_path);
+    std::string file_path = "/home/kenji/ws_livox/src/lidar_subscriber/data/fast-lio";
+    std::string file_name = createTimestampedFilename(file_path);
 
     count += 1;
-    //ROS_INFO("Count: %ld Integrated Angle: [%f, %f, %f]", count, integrated_angle(0), integrated_angle(1), integrated_angle(2));
 
     printf("\e[36m<--- End of session --->\e[0m\n");
+    printf("\e[36m<--- /cloud_registered process --->\e[0m\n");
 
     // Save to a PCD file
     //pcl::io::savePCDFileASCII(fileName, *pcl_cloud);
 
     // Save to a PCD file
-    /*
-    bool result = open3d::io::WritePointCloud(file_name, *source_downsampled);
-    if (result) {
-        std::cout << "\e[32m" << "Successfully saved the point cloud." << "\e[m" << std::endl;
-    } else {
-        std::cerr << "\e[31m" << "Failed to save the point cloud." << "\e[m" << std::endl;
-    }
-    */
+    // bool result = open3d::io::WritePointCloud(file_name, *source_downsampled);
+    // if (result) {
+    //     std::cout << "\e[32m" << "Successfully saved the point cloud." << "\e[m" << std::endl;
+    // } else {
+    //     std::cerr << "\e[31m" << "Failed to save the point cloud." << "\e[m" << std::endl;
+    // }
 
     //ROS_INFO("Saved %d data points to %s", cloud->size(), fileName.c_str());
 }
 
-void imu_callback(const sensor_msgs::ImuConstPtr& imu_msg) {
-    /*
-    tf::Quaternion q(imu_msg->orientation.x, imu_msg->orientation.y, imu_msg->orientation.z, imu_msg->orientation.w);
-    tf::Matrix3x3 m(q);
+void send_pcd_process() {
+    // while (true) {
+    //     if (stop_send_flag == true) {
+    //         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    //         continue;
+    //     }
 
-    double roll, pitch, yaw;
-    m.getRPY(roll, pitch, yaw);
-
-    roll = roll * 180 / M_PI;
-    pitch = pitch * 180 / M_PI;
-    yaw = yaw * 180 / M_PI;
-    
-    ROS_INFO("IMU Data - Orientation: Roll: [%f], Pitch: [%f], Yaw: [%f], Orientation: [%f, %f, %f, %f], Angular Velocity: [%f, %f, %f], Linear Acceleration: [%f, %f, %f]",
-            roll, pitch, yaw,
-            imu_msg->orientation.x, imu_msg->orientation.y, imu_msg->orientation.z, imu_msg->orientation.w,
-            imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z,
-            imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z);
-    */
-    /*
-    double angular_velocity_x = imu_msg->angular_velocity.x * 180 / M_PI;
-    double angular_velocity_y = imu_msg->angular_velocity.y * 180 / M_PI;
-    double angular_velocity_z = imu_msg->angular_velocity.z * 180 / M_PI;
-
-    if (current_index < MAX_DATA_SIZE) {
-        angular_velocity_x_array[current_index] = angular_velocity_x;
-        angular_velocity_y_array[current_index] = angular_velocity_y;
-        angular_velocity_z_array[current_index] = angular_velocity_z;
-        current_index++;
-    } 
-    */
-
-    // <--- Added Getting IMU data on 2024/09/24 --->
-    // Convert the accelerometer data to roll and pitch
-    double accel_x = imu_msg->linear_acceleration.x;
-    double accel_y = imu_msg->linear_acceleration.y;
-    double accel_z = imu_msg->linear_acceleration.z;
-
-    // Calculate pitch and roll
-    roll = atan2(accel_y, accel_z) * 180.0 / M_PI;
-    pitch = atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z)) * 180.0 / M_PI;
-
-    // Print the results
-    //ROS_INFO("IMU Data - Roll: [%f] degrees, Pitch: [%f] degrees", roll, pitch);
-
-    imu_callback_count++;
-    accumulated_angle(0) += imu_msg->angular_velocity.x;
-    accumulated_angle(1) += imu_msg->angular_velocity.y;
-    accumulated_angle(2) += imu_msg->angular_velocity.z;
-    // <--- Added Getting IMU data on 2024/09/24 --->
-
-    /*
-    Eigen::Vector3d angular_velocity(
-            imu_msg->angular_velocity.x * 180 / M_PI,
-            imu_msg->angular_velocity.y * 180 / M_PI,
-            imu_msg->angular_velocity.z * 180 / M_PI
-    );
-    
-    //check_max_value(angular_velocity);
-    //std::cout << "Max Angular Velocity: " << max_angular_velocity << std::endl;
-    //angular_velocity_array.push_back(angular_velocity);
-
-    // Filter out measurement errors
-    // Maybe you could set the threshold at 5 degree.
-    //if (angular_velocity(0) < 1.65) {
-    if (angular_velocity(0) < 5.00) {
-        angular_velocity(0) = 0.0;
-    }
-    //if (angular_velocity(1) < 2.5) {
-    if (angular_velocity(1) < 5.00) {
-        angular_velocity(1) = 0.0;
-    }
-    //if (angular_velocity(2) < 1.6) {
-    if (angular_velocity(2) < 5.00) {
-        angular_velocity(2) = 0.0;
-    }
-
-    integrated_angle += angular_velocity * time_interval;
-    //std::cout << "Integrated Angle: " << angular_velocity << std::endl;
-    //last_time = ros::Time::now();
-    */
-
-    /*
-    ROS_INFO("IMU Data - Angular Velocity(Degree): [%f, %f, %f], Angular Velocity: [%f, %f, %f], Linear Acceleration: [%f, %f, %f]",
-        angular_velocity_x, angular_velocity_y, angular_velocity_z,
-        imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z,
-        imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z);
-    */
+    //     {
+    //         // Transform the point cloud data from Open3D PointCloud to data_packet
+    //         std::unique_lock<std::mutex> lock(thread_control_flag->float_array_ptr_mutex);
+    //         send_cv.wait(lock, [] { return can_send_pcd; });
+    //         int run_result = send_data("180.145.242.113", "1234", data_packet_ptr);
+    //         can_send_pcd = false;
+    //     }
+    //     printf("\e[36m<--- send_pcd process --->\e[0m\n");
+    // }
 }
+
 
 void timer_callback(const ros::TimerEvent&) {
     ROS_INFO("IMU callback was called %d times in the last second.", imu_callback_count);
     imu_callback_count = 0;  // カウントをリセット
+}
+
+void stop_send_process() {
+    auto start_time = std::chrono::steady_clock::now();
+    while (stop_send_flag) {
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+        std::cout << "\e[34m" << "Collecting entire point cloud data from /Laser_map topic(FAST-LIO)... " << seconds << " seconds have passed." << "\e[0m" << std::endl;
+
+        if (seconds >= 1) {
+            std::cout << "15 seconds have passed. Stopping thread..." << std::endl;
+            stop_send_flag = false;
+            break;
+        }
+
+        boost::this_thread::sleep_for(boost::chrono::seconds(1));
+    }
 }
 
 int main(int argc, char** argv) {
@@ -277,23 +276,55 @@ int main(int argc, char** argv) {
     ros::init(argc, argv, "livox_point_cloud_listener");
     ros::NodeHandle nh;
 
+    if (data_packet_ptr == NULL) {
+        data_packet_ptr = (data_packet*)malloc(sizeof(data_packet));
+        data_packet_ptr->float_array_ptr = (double*)malloc(sizeof(double) * NUM_FLOATS * 3);
+        thread_control_flag = (Thread_Control_Flag*)malloc(sizeof(Thread_Control_Flag));
+    }
+
     // Create a ROS subscriber
-    ros::Subscriber sub = nh.subscribe<sensor_msgs::PointCloud2>("livox/lidar", 1, callback);
+    //ros::Subscriber sub = nh.subscribe<sensor_msgs::PointCloud2>("livox/lidar", 1, callback);
 
-    ros::Subscriber imu_sub = nh.subscribe<sensor_msgs::Imu>("livox/imu", 1, imu_callback);
+    // Create a ROS subscriber for get entire point cloud data from /Laser_map topic(FAST-LIO)
+    //ros::Subscriber sub1 = nh.subscribe<sensor_msgs::PointCloud2>("/Laser_map", 1, callback_for_laser_map);
+    ros::Subscriber sub2 = nh.subscribe<sensor_msgs::PointCloud2>("/cloud_registered", 1, callback_for_cloud_registered);
 
-    // 1秒ごとにコールバック回数を表示するためのタイマー
-    //ros::Timer timer = nh.createTimer(ros::Duration(1.0), timer_callback);
+    boost::asio::io_service io_service;
+    boost::asio::signal_set signals(io_service, SIGINT);
+
+    signals.async_wait(
+        [](const boost::system::error_code&, int) {
+            std::cout << "\nSIGINT received. Stopping thread..." << std::endl;
+            stop_send_flag = false;
+            ros::shutdown();
+        }
+    );
+
+    boost::thread io_service_thread([&io_service]() { io_service.run(); });
+    boost::thread worker(stop_send_process);
+    boost::thread send_pcd_worker(send_pcd_process);
 
     // 初期時間の設定
     last_time = ros::Time::now();
+    last_callback_time = ros::Time::now();
 
     // Spin to continuously get data from callback
+    // ros::AsyncSpinner spinner(2);
+    // spinner.start();
+
     ros::spin();
+
+    ros::waitForShutdown();
+
+    io_service.stop();
+    io_service_thread.join();
+    worker.join();
+    send_pcd_worker.join();
 
     if (data_packet_ptr != NULL) {
         free(data_packet_ptr->float_array_ptr);
         free(data_packet_ptr);
+        free(thread_control_flag);
         std::cout << "\e[33m" << "Freed allocated memory." << "\e[m" << std::endl;
         //save_angular_velocity_data();
     }

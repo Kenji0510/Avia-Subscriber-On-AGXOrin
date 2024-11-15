@@ -383,7 +383,7 @@ int send_data(const char* ip_addr, const char* port_num, data_packet* packet_ptr
 
     memcpy(conn_io->header_data, packet_ptr, conn_io->header_size);
 
-    conn_io->file_size = sizeof(double) * packet_ptr->num_points * 3;
+    conn_io->file_size = (packet_ptr->num_points_of_cloud_registered + packet_ptr->num_points_of_laser_map) * sizeof(double) * 3;
     conn_io->file_data = (uint8_t *)packet_ptr->float_array_ptr;
     conn_io->is_sent_header = 0;
     conn_io->file_offset = 0;
@@ -416,9 +416,8 @@ int send_data(const char* ip_addr, const char* port_num, data_packet* packet_ptr
     ev_break(loop, EVBREAK_ALL);
     ev_loop_destroy(loop);
 
-    printf("Unix time: %ld\n", packet_ptr->initial_time);
-    printf("Num points: %ld\n", packet_ptr->num_points);
-    printf("First float: %f\n", packet_ptr->float_array_ptr[0]);
+    // printf("Num points: %ld\n", packet_ptr->num_points);
+    // printf("First float: %f\n", packet_ptr->float_array_ptr[0]);
 
 
     //free(conn_io->file_data);

@@ -3,8 +3,8 @@
 
 void downsample(std::shared_ptr<open3d::geometry::PointCloud>& source, std::shared_ptr<open3d::geometry::PointCloud>& downsampled_source) {
     double voxel_size = 0.1;
-    int nb_neighbors = 30;
-    double std_ratio = 0.1;
+    int nb_neighbors = 10;
+    double std_ratio = 1;     // 0.1 is not adopted.
     
     auto source_tensor = open3d::t::geometry::PointCloud::FromLegacy(*source, open3d::core::Dtype::Float32, open3d::core::Device("CUDA:0"));
 
